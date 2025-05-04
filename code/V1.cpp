@@ -6,7 +6,7 @@
 #include <limits>
 #include <chrono>
 #include <algorithm>
- #include <queue>
+#include <queue>
 #include <unordered_set>
 #include <unordered_map>
 
@@ -529,6 +529,8 @@ vector<EdgeChange> parseChangesFile(const string& filePath) {
 void main_sssp_update(const string& graphFilePath, const string& changesFilePath, 
                     int sourceVertex = 1, const string& outputFilePath = "sssp_result.txt") {
     cout << "Loading graph from " << graphFilePath << "..." << endl;
+    
+    auto startTime1 = chrono::high_resolution_clock::now();
     Graph graph = Graph::fromMetisFile(graphFilePath);
     cout << "Graph loaded with " << graph.getVertexCount() << " vertices and " 
               << graph.getEdgeCount() << " edges." << endl;
@@ -537,9 +539,14 @@ void main_sssp_update(const string& graphFilePath, const string& changesFilePath
     int zeroBasedSource = sourceVertex - 1;
     if (zeroBasedSource < 0) zeroBasedSource = 0;
     
-    cout << "Computing initial SSSP from source vertex " << sourceVertex << "..." << endl;
+
     SSSPTree sssp = computeInitialSSSP(graph, zeroBasedSource);
     
+    auto endTime1 = chrono::high_resolution_clock::now();
+    auto executionTimeMs1 = chrono::duration_cast<chrono::milliseconds>(endTime1 - startTime1).count();
+    cout << "Initial SSSP computed in " << executionTimeMs1 << " ms." << endl;
+
+
     cout << "Loading changes from " << changesFilePath << "..." << endl;
     vector<EdgeChange> changes = parseChangesFile(changesFilePath);
     cout << "Loaded " << changes.size() << " changes." << endl;
