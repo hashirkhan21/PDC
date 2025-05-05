@@ -1,1057 +1,1175 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
-#include <limits.h>
-#include <omp.h>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <limits>
+#include <chrono>
+#include <algorithm>
+#include <queue>
+#include <unordered_set>
+#include <unordered_map>
 #include <mpi.h>
 #include <metis.h>
 
-#define MAX_LINE_LENGTH 1024
-#define INF INT_MAX
+using namespace std;
 
-typedef struct {
-    int source;
-    int target;
-    int weight;
-} Edge;
+// Define infinity for distance values
+const double INF = numeric_limits<double>::infinity();
 
-typedef struct {
-    int count;
-    Edge* edges;
-} EdgeSet;
-
-typedef struct {
-    int numVertices;
-    int numEdges;
-    int* xadj;        // CSR format adjacency array pointers
-    int* adjncy;      // CSR format adjacency array
-    int* weights;     // Edge weights
-    int* dist;        // Distance from source
-    int* parent;      // Parent in SSSP tree
-    bool* affected;   // Whether vertex is affected by changes
-    bool* affected_del; // Whether vertex is affected by deletion
+// Structure to represent an edge in the graph
+struct Edge {
+    int src;
+    int dest;
+    double weight;
     
-    // Ghost vertices for MPI communication
-    int numGhostVertices;
-    int* ghostVertices;    // Global indices of ghost vertices
-    int* ghostLocalIdx;    // Local indices of ghost vertices 
-    int* ghostPartition;   // Partition IDs for ghost vertices
+    Edge(int s, int d, double w) : src(s), dest(d), weight(w) {}
     
-    // Partition information
-    int numLocalVertices;  // Number of vertices owned by this process
-    int* globalIdx;        // Global indices of local vertices
-} Graph;
+    // Equality operator for finding edges
+    bool operator==(const Edge& other) const {
+        return (src == other.src && dest == other.dest) || 
+               (src == other.dest && dest == other.src);
+    }
+};
 
-
-int mpi_rank, mpi_size;
-int* vertexToPartition;    // Maps global vertex index to partition ID
-int** partitionVertices;   // Lists of vertices in each partition
-int* partitionSizes;       // Number of vertices in each partition
-int** partitionNeighbors;  // Lists of neighboring partitions for each partition
-int* numPartitionNeighbors; // Number of neighboring partitions
-
-// Function prototypes
-void readGraph(Graph* graph, char* filename);
-void readChanges(char* filename, EdgeSet* deletedEdges, EdgeSet* insertedEdges);
-void initializeSSSP(Graph* graph, int sourceVertex);
-void partitionGraph(Graph* graph, int numPartitions);
-void distributeGraphPartitions(Graph* fullGraph, Graph* localGraph);
-void processChangedEdges(Graph* graph, EdgeSet* deletedEdges, EdgeSet* insertedEdges);
-void updateAffectedVertices(Graph* graph);
-void gatherResults(Graph* fullGraph, Graph* localGraph);
-void outputSSSP(Graph* graph, int sourceVertex);
-void freeGraph(Graph* graph);
-void freeEdgeSet(EdgeSet* edgeSet);
-
-
-
-
-void exchangeGhostVertexData(Graph* graph) {
-    // Arrays for sending and receiving data
-    int* sendCounts = (int*)calloc(mpi_size, sizeof(int));
-    int* recvCounts = (int*)calloc(mpi_size, sizeof(int));
-    int* sendDispls = (int*)malloc(mpi_size * sizeof(int));
-    int* recvDispls = (int*)malloc(mpi_size * sizeof(int));
-    
-    // Count vertices to send to each process
-    for (int i = 0; i < graph->numLocalVertices; i++) {
-        for (int j = 0; j < numPartitionNeighbors[mpi_rank]; j++) {
-            int destRank = partitionNeighbors[mpi_rank][j];
-            sendCounts[destRank]++;
+// For hashing Edge in unordered sets
+namespace std {
+    template <>
+    struct hash<Edge> {
+        size_t operator()(const Edge& e) const {
+            // Ensure hash is symmetric for undirected edges
+            int min_vertex = min(e.src, e.dest);
+            int max_vertex = max(e.src, e.dest);
+            return hash<int>()(min_vertex) ^ hash<int>()(max_vertex);
         }
+    };
+}
+
+// Structure to represent a neighbor in adjacency list
+struct Neighbor {
+    int vertex;
+    double weight;
+    
+    Neighbor(int v, double w) : vertex(v), weight(w) {}
+};
+
+// Structure to represent an edge change
+struct EdgeChange {
+    Edge edge;
+    bool isInsertion;
+    
+    EdgeChange(int u, int v, double w, bool insert) 
+        : edge(u, v, w), isInsertion(insert) {}
+};
+
+// Structure to represent a vertex update message
+struct VertexUpdate {
+    int vertex;
+    double distance;
+    int parent;
+    
+    VertexUpdate(int v, double d, int p) : vertex(v), distance(d), parent(p) {}
+};
+
+// Class to represent the distributed graph
+class DistributedGraph {
+private:
+    int V;              // Total number of vertices in full graph
+    int local_start;    // Starting vertex ID for this partition
+    int local_count;    // Number of vertices in this partition
+    vector<vector<Neighbor>> adjacencyList;
+    vector<Edge> edges;
+    vector<int> vertexToPartition;  // Maps vertex ID to partition ID
+    vector<int> localToGlobalMap;   // Maps local vertex ID to global vertex ID
+    vector<int> globalToLocalMap;   // Maps global vertex ID to local vertex ID
+    vector<bool> isGhostVertex;     // Indicates whether a vertex is a ghost vertex
+    vector<int> boundaryVertices;   // List of boundary vertices (have edges to other partitions)
+    unordered_set<int> ghostVertices; // Set of ghost vertices (from other partitions)
+    int rank;           // MPI rank
+    int num_procs;      // Total MPI processes
+
+public:
+    // Constructor with partition info
+    DistributedGraph(int vertices, int myRank, int numProcs) 
+        : V(vertices), rank(myRank), num_procs(numProcs) {
+        globalToLocalMap.resize(vertices, -1);
     }
     
-    // Communicate send and receive counts
-    MPI_Alltoall(sendCounts, 1, MPI_INT, recvCounts, 1, MPI_INT, MPI_COMM_WORLD);
-    
-    // Calculate displacements
-    sendDispls[0] = 0;
-    recvDispls[0] = 0;
-    for (int i = 1; i < mpi_size; i++) {
-        sendDispls[i] = sendDispls[i-1] + sendCounts[i-1];
-        recvDispls[i] = recvDispls[i-1] + recvCounts[i-1];
-    }
-    
-    // Calculate total send and receive counts
-    int totalSendCount = sendDispls[mpi_size-1] + sendCounts[mpi_size-1];
-    int totalRecvCount = recvDispls[mpi_size-1] + recvCounts[mpi_size-1];
-    
-    // Prepare send buffer: [global_idx, dist, parent_global_idx]
-    int* sendBuffer = (int*)malloc(totalSendCount * 3 * sizeof(int));
-    int* sendOffset = (int*)calloc(mpi_size, sizeof(int));
-    
-    for (int i = 0; i < graph->numLocalVertices; i++) {
-        for (int j = 0; j < numPartitionNeighbors[mpi_rank]; j++) {
-            int destRank = partitionNeighbors[mpi_rank][j];
-            int pos = (sendDispls[destRank] + sendOffset[destRank]) * 3;
-            
-            sendBuffer[pos] = graph->globalIdx[i];
-            sendBuffer[pos+1] = graph->dist[i];
-            
-            // Convert local parent index to global
-            if (graph->parent[i] == -1) {
-                sendBuffer[pos+2] = -1;
-            } else if (graph->parent[i] < graph->numLocalVertices) {
-                sendBuffer[pos+2] = graph->globalIdx[graph->parent[i]];
-            } else {
-                int ghostIdx = graph->parent[i] - graph->numLocalVertices;
-                sendBuffer[pos+2] = graph->ghostVertices[ghostIdx];
-            }
-            
-            sendOffset[destRank]++;
-        }
-    }
-    
-    // Receive buffer: [global_idx, dist, parent_global_idx]
-    int* recvBuffer = (int*)malloc(totalRecvCount * 3 * sizeof(int));
-    
-    // Exchange data
-    MPI_Alltoallv(sendBuffer, sendCounts, sendDispls, MPI_INT,
-                 recvBuffer, recvCounts, recvDispls, MPI_INT,
-                 MPI_COMM_WORLD);
-    
-    // Process received data
-    for (int i = 0; i < totalRecvCount; i++) {
-        int globalIdx = recvBuffer[i*3];
-        int dist = recvBuffer[i*3+1];
-        int parentGlobalIdx = recvBuffer[i*3+2];
+    // Initialize the distributed graph from a partitioned graph
+    void initializeFromPartition(const vector<int>& partition, const Graph& fullGraph) {
+        vertexToPartition = partition;
         
-        // Find local index of this vertex
-        int localIdx = -1;
-        
-        // Check if it's a ghost vertex
-        for (int j = 0; j < graph->numGhostVertices; j++) {
-            if (graph->ghostVertices[j] == globalIdx) {
-                localIdx = graph->numLocalVertices + j;
-                break;
+        // Count local vertices
+        local_count = 0;
+        for (int i = 0; i < V; i++) {
+            if (vertexToPartition[i] == rank) {
+                local_count++;
             }
         }
         
-        // If not found, skip
-        if (localIdx == -1) continue;
+        // Create local to global mapping
+        localToGlobalMap.resize(local_count);
+        int localIdx = 0;
+        for (int i = 0; i < V; i++) {
+            if (vertexToPartition[i] == rank) {
+                localToGlobalMap[localIdx] = i;
+                globalToLocalMap[i] = localIdx;
+                localIdx++;
+            }
+        }
         
-        // Update distance if better
-        if (dist < graph->dist[localIdx]) {
-            graph->dist[localIdx] = dist;
+        // Resize adjacency list
+        adjacencyList.resize(local_count);
+        isGhostVertex.resize(local_count, false);
+        
+        // Find boundary vertices and ghost vertices
+        for (int localV = 0; localV < local_count; localV++) {
+            int globalV = localToGlobalMap[localV];
             
-            // Convert global parent to local
-            int parentLocalIdx = -1;
-            if (parentGlobalIdx != -1) {
-                // Check if parent is local
-                for (int j = 0; j < graph->numLocalVertices; j++) {
-                    if (graph->globalIdx[j] == parentGlobalIdx) {
-                        parentLocalIdx = j;
-                        break;
+            // Check all neighbors in the full graph
+            for (const auto& neighbor : fullGraph.getNeighbors(globalV)) {
+                int neighborGlobalID = neighbor.vertex;
+                double weight = neighbor.weight;
+                
+                if (vertexToPartition[neighborGlobalID] == rank) {
+                    // Local neighbor
+                    int neighborLocalID = globalToLocalMap[neighborGlobalID];
+                    adjacencyList[localV].push_back(Neighbor(neighborLocalID, weight));
+                } else {
+                    // Neighbor in another partition - boundary vertex
+                    boundaryVertices.push_back(localV);
+                    ghostVertices.insert(neighborGlobalID);
+                    break;
+                }
+            }
+        }
+        
+        // Add ghost vertices to local graph
+        for (int ghostV : ghostVertices) {
+            int localGhostIdx = local_count + ghostVertices.size();
+            globalToLocalMap[ghostV] = localGhostIdx;
+            localToGlobalMap.push_back(ghostV);
+            adjacencyList.push_back(vector<Neighbor>());
+            isGhostVertex.push_back(true);
+        }
+        
+        // Add edges between local vertices and ghost vertices
+        for (int localV = 0; localV < local_count; localV++) {
+            int globalV = localToGlobalMap[localV];
+            
+            for (const auto& neighbor : fullGraph.getNeighbors(globalV)) {
+                int neighborGlobalID = neighbor.vertex;
+                double weight = neighbor.weight;
+                
+                if (vertexToPartition[neighborGlobalID] != rank) {
+                    // Add connection to ghost vertex
+                    int ghostLocalID = globalToLocalMap[neighborGlobalID];
+                    adjacencyList[localV].push_back(Neighbor(ghostLocalID, weight));
+                    adjacencyList[ghostLocalID].push_back(Neighbor(localV, weight));
+                    
+                    // Add edge
+                    edges.push_back(Edge(localV, ghostLocalID, weight));
+                }
+            }
+        }
+    }
+    
+    // Add edge to the distributed graph
+    void addEdge(int u, int v, double weight) {
+        int localU = globalToLocalMap[u];
+        int localV = globalToLocalMap[v];
+        
+        if (localU >= 0 && localV >= 0) {
+            // Both vertices are local or ghost
+            edges.push_back(Edge(localU, localV, weight));
+            adjacencyList[localU].push_back(Neighbor(localV, weight));
+            adjacencyList[localV].push_back(Neighbor(localU, weight));
+        }
+    }
+    
+    // Remove edge from the distributed graph
+    void removeEdge(int u, int v) {
+        int localU = globalToLocalMap[u];
+        int localV = globalToLocalMap[v];
+        
+        if (localU >= 0 && localV >= 0) {
+            // Remove from edges list
+            edges.erase(
+                remove_if(edges.begin(), edges.end(), 
+                    [localU, localV](const Edge& e) { 
+                        return (e.src == localU && e.dest == localV) || 
+                               (e.src == localV && e.dest == localU); 
                     }
+                ),
+                edges.end()
+            );
+            
+            // Remove from adjacency list
+            adjacencyList[localU].erase(
+                remove_if(adjacencyList[localU].begin(), adjacencyList[localU].end(),
+                    [localV](const Neighbor& n) { return n.vertex == localV; }
+                ),
+                adjacencyList[localU].end()
+            );
+            
+            adjacencyList[localV].erase(
+                remove_if(adjacencyList[localV].begin(), adjacencyList[localV].end(),
+                    [localU](const Neighbor& n) { return n.vertex == localU; }
+                ),
+                adjacencyList[localV].end()
+            );
+        }
+    }
+    
+    // Get number of vertices including ghost vertices
+    int getVertexCount() const {
+        return adjacencyList.size();
+    }
+    
+    // Get number of local vertices (excluding ghosts)
+    int getLocalVertexCount() const {
+        return local_count;
+    }
+    
+    // Get number of edges
+    int getEdgeCount() const {
+        return edges.size();
+    }
+    
+    // Get adjacency list for local vertex
+    const vector<Neighbor>& getNeighbors(int localVertex) const {
+        return adjacencyList[localVertex];
+    }
+    
+    // Get all edges
+    const vector<Edge>& getEdges() const {
+        return edges;
+    }
+    
+    // Get local index from global index
+    int getLocalIndex(int globalIndex) const {
+        return globalToLocalMap[globalIndex];
+    }
+    
+    // Get global index from local index
+    int getGlobalIndex(int localIndex) const {
+        return localToGlobalMap[localIndex];
+    }
+    
+    // Check if vertex is a boundary vertex
+    bool isBoundaryVertex(int localVertex) const {
+        return find(boundaryVertices.begin(), boundaryVertices.end(), localVertex) != boundaryVertices.end();
+    }
+    
+    // Check if vertex is a ghost vertex
+    bool isGhost(int localVertex) const {
+        return (localVertex >= local_count);
+    }
+    
+    // Get the owner process of a global vertex
+    int getOwnerProcess(int globalVertex) const {
+        return vertexToPartition[globalVertex];
+    }
+    
+    // Get boundary vertices
+    const vector<int>& getBoundaryVertices() const {
+        return boundaryVertices;
+    }
+    
+    // Get ghost vertices
+    vector<int> getGhostVertices() const {
+        vector<int> result;
+        for (int i = local_count; i < getVertexCount(); i++) {
+            result.push_back(i);
+        }
+        return result;
+    }
+};
+
+// Class to represent a graph using adjacency list
+class Graph {
+private:
+    int V; // Number of vertices
+    vector<vector<Neighbor>> adjacencyList;
+    vector<Edge> edges;
+
+public:
+    // Constructor
+    Graph(int vertices) : V(vertices) {
+        adjacencyList.resize(vertices);
+    }
+    
+    // Add an edge to the graph
+    void addEdge(int u, int v, double weight) {
+        edges.push_back(Edge(u, v, weight));
+        adjacencyList[u].push_back(Neighbor(v, weight));
+        adjacencyList[v].push_back(Neighbor(u, weight)); // For undirected graph
+    }
+    
+    // Remove an edge from the graph
+    void removeEdge(int u, int v) {
+        // Remove from edges list
+        edges.erase(
+            remove_if(edges.begin(), edges.end(), 
+                [u, v](const Edge& e) { 
+                    return (e.src == u && e.dest == v) || (e.src == v && e.dest == u); 
+                }
+            ),
+            edges.end()
+        );
+        
+        // Remove from adjacency list
+        adjacencyList[u].erase(
+            remove_if(adjacencyList[u].begin(), adjacencyList[u].end(),
+                [v](const Neighbor& n) { return n.vertex == v; }
+            ),
+            adjacencyList[u].end()
+        );
+        
+        adjacencyList[v].erase(
+            remove_if(adjacencyList[v].begin(), adjacencyList[v].end(),
+                [u](const Neighbor& n) { return n.vertex == u; }
+            ),
+            adjacencyList[v].end()
+        );
+    }
+    
+    // Get number of vertices
+    int getVertexCount() const {
+        return V;
+    }
+    
+    // Get number of edges
+    int getEdgeCount() const {
+        return edges.size();
+    }
+    
+    // Get adjacency list
+    const vector<Neighbor>& getNeighbors(int vertex) const {
+        return adjacencyList[vertex];
+    }
+    
+    // Get all edges
+    const vector<Edge>& getEdges() const {
+        return edges;
+    }
+    
+    // Load graph from METIS format file
+    static Graph fromMetisFile(const string& filePath) {
+        ifstream file(filePath);
+        if (!file.is_open()) {
+            throw runtime_error("Could not open file: " + filePath);
+        }
+        
+        string line;
+        // Skip comment lines
+        do {
+            getline(file, line);
+        } while (line[0] == '%' && !file.eof());
+        
+        // Parse header line
+        istringstream headerStream(line);
+        int numVertices, numEdges;
+        int format = 0;
+        
+        headerStream >> numVertices >> numEdges;
+        if (!headerStream.eof()) {
+            headerStream >> format;
+        }
+        
+        // Check if the graph has weights (format flag 1 or 11)
+        bool hasWeights = (format == 1 || format == 11);
+        
+        Graph graph(numVertices);
+        
+        // Parse adjacency lists
+        for (int i = 0; i < numVertices; i++) {
+            if (file.eof()) break;
+            
+            getline(file, line);
+            istringstream lineStream(line);
+            
+            if (hasWeights) {
+                // If graph has weights, adjacency info alternates between vertex and weight
+                int vertex;
+                double weight;
+                
+                while (lineStream >> vertex >> weight) {
+                    vertex--; // METIS uses 1-based indexing
+                    
+                    // Add edge only if we haven't added it before (avoid duplicates in undirected graph)
+                    if (i < vertex) {
+                        graph.addEdge(i, vertex, weight);
+                    }
+                }
+            } else {
+                // If graph doesn't have weights, each entry is just a vertex
+                int vertex;
+                
+                while (lineStream >> vertex) {
+                    vertex--; // METIS uses 1-based indexing
+                    
+                    // Add edge only if we haven't added it before (avoid duplicates in undirected graph)
+                    if (i < vertex) {
+                        graph.addEdge(i, vertex, 1.0); // Default weight is 1
+                    }
+                }
+            }
+        }
+        
+        file.close();
+        return graph;
+    }
+    
+    // Partition the graph using METIS
+    vector<int> partitionWithMetis(int numPartitions) const {
+        // Prepare METIS inputs
+        idx_t nvtxs = V;
+        idx_t ncon = 1;  // Number of balancing constraints
+        
+        // Convert adjacency list to CSR format required by METIS
+        vector<idx_t> xadj(V + 1);
+        vector<idx_t> adjncy;
+        vector<idx_t> adjwgt;
+        
+        xadj[0] = 0;
+        for (int i = 0; i < V; i++) {
+            for (const auto& neighbor : adjacencyList[i]) {
+                adjncy.push_back(neighbor.vertex);
+                adjwgt.push_back(static_cast<idx_t>(neighbor.weight));
+            }
+            xadj[i + 1] = adjncy.size();
+        }
+        
+        // Set up partitioning parameters
+        idx_t nparts = numPartitions;
+        idx_t objval;
+        vector<idx_t> part(V);
+        
+        // Set METIS options
+        idx_t options[METIS_NOPTIONS];
+        METIS_SetDefaultOptions(options);
+        options[METIS_OPTION_OBJTYPE] = METIS_OBJTYPE_CUT;  // Minimize edge-cut
+        options[METIS_OPTION_CONTIG] = 1;                   // Force contiguous partitions
+        
+        // Call METIS partitioning function
+        int ret = METIS_PartGraphKway(
+            &nvtxs, &ncon, xadj.data(), adjncy.data(), 
+            NULL, NULL, adjwgt.data(), &nparts, 
+            NULL, NULL, options, &objval, part.data()
+        );
+        
+        if (ret != METIS_OK) {
+            throw runtime_error("METIS partitioning failed with error code: " + to_string(ret));
+        }
+        
+        // Convert idx_t vector to int vector
+        vector<int> partition(V);
+        for (int i = 0; i < V; i++) {
+            partition[i] = static_cast<int>(part[i]);
+        }
+        
+        return partition;
+    }
+};
+
+// Class to represent the SSSP tree
+class SSSPTree {
+private:
+    int V;              // Number of vertices
+    int source;         // Source vertex
+    int local_source;   // Local index of source vertex (if in this partition)
+    vector<int> parent; // Parent of each vertex in the SSSP tree
+    vector<double> distance; // Distance of each vertex from the source
+    vector<bool> affected_del; // If vertex is affected by deletion
+    vector<bool> affected; // If vertex is affected by any change
+    DistributedGraph* graph; // Pointer to distributed graph
+    int rank;           // MPI rank
+
+public:
+    // Constructor for distributed SSSP tree
+    SSSPTree(int vertices, int global_src, DistributedGraph* g, int myRank) 
+      : V(vertices), source(global_src), graph(g), rank(myRank) {
+        
+        parent.resize(vertices, -1);
+        distance.resize(vertices, INF);
+        affected_del.resize(vertices, false);
+        affected.resize(vertices, false);
+        
+        // Set local source if it belongs to this partition
+        local_source = graph->getLocalIndex(source);
+        if (local_source >= 0 && local_source < graph->getLocalVertexCount()) {
+            distance[local_source] = 0;
+        }
+    }
+    
+    // Check if edge (u,v) is part of the SSSP tree
+    bool isTreeEdge(int u, int v) const {
+        return (parent[v] == u || parent[u] == v);
+    }
+    
+    // Get parent of a vertex
+    int getParent(int vertex) const {
+        return parent[vertex];
+    }
+    
+    // Set parent of a vertex
+    void setParent(int vertex, int p) {
+        parent[vertex] = p;
+    }
+    
+    // Get distance of a vertex from source
+    double getDistance(int vertex) const {
+        return distance[vertex];
+    }
+    
+    // Set distance of a vertex from source
+    void setDistance(int vertex, double dist) {
+        distance[vertex] = dist;
+    }
+    
+    // Mark vertex as affected by deletion
+    void markAffectedByDeletion(int vertex, bool value) {
+        affected_del[vertex] = value;
+    }
+    
+    // Check if vertex is affected by deletion
+    bool isAffectedByDeletion(int vertex) const {
+        return affected_del[vertex];
+    }
+    
+    // Mark vertex as affected
+    void markAffected(int vertex, bool value) {
+        affected[vertex] = value;
+    }
+    
+    // Check if vertex is affected
+    bool isAffected(int vertex) const {
+        return affected[vertex];
+    }
+    
+    // Get source vertex
+    int getSource() const {
+        return source;
+    }
+    
+    // Get local source vertex
+    int getLocalSource() const {
+        return local_source;
+    }
+    
+    // Get number of vertices
+    int getVertexCount() const {
+        return V;
+    }
+    
+    // Check if any vertex is affected by deletion
+    bool hasAffectedByDeletion() const {
+        for (int i = 0; i < graph->getLocalVertexCount(); i++) {
+            if (affected_del[i]) return true;
+        }
+        return false;
+    }
+    
+    // Check if any vertex is affected
+    bool hasAffected() const {
+        for (int i = 0; i < graph->getLocalVertexCount(); i++) {
+            if (affected[i]) return true;
+        }
+        return false;
+    }
+    
+    // Get all children of a vertex in the SSSP tree
+    vector<int> getChildren(int vertex) const {
+        vector<int> children;
+        for (int i = 0; i < V; i++) {
+            if (parent[i] == vertex) {
+                children.push_back(i);
+            }
+        }
+        return children;
+    }
+    
+    // Save SSSP tree to file with 1-based indexing
+    void saveToFile(const string& filePath) const {
+        // Only rank 0 writes to file
+        if (rank != 0) return;
+        
+        ofstream file(filePath);
+        if (!file.is_open()) {
+            throw runtime_error("Could not open file for writing: " + filePath);
+        }
+        
+        file << "# SSSP Tree from source " << (source + 1) << endl;  // Convert to 1-based indexing for output
+        file << "# Vertex\tDistance\tParent" << endl;
+        
+        // Gather all vertex information from all processes
+        vector<double> global_distances(V, INF);
+        vector<int> global_parents(V, -1);
+        
+        // First collect local data
+        for (int i = 0; i < graph->getLocalVertexCount(); i++) {
+            int global_idx = graph->getGlobalIndex(i);
+            global_distances[global_idx] = distance[i];
+            
+            if (parent[i] != -1) {
+                global_parents[global_idx] = graph->getGlobalIndex(parent[i]);
+            }
+        }
+        
+        // Gather from other processes
+        // (Implementation details would depend on MPI communication pattern)
+        
+        // Now write the global data to file
+        for (int i = 0; i < V; i++) {
+            // Output vertex index in 1-based indexing
+            file << (i + 1) << "\t";  // Convert to 1-based indexing
+            
+            if (global_distances[i] == INF) {
+                file << "INF";
+            } else {
+                file << global_distances[i];
+            }
+            
+            file << "\t";
+            
+            if (global_parents[i] == -1) {
+                file << "-";
+            } else {
+                file << (global_parents[i] + 1);  // Convert parent to 1-based indexing
+            }
+            
+            file << endl;
+        }
+        
+        file.close();
+    }
+    
+    // Collect all SSSP data from all processes (used for root process)
+    void gatherGlobalSSSP(vector<double>& global_distances, vector<int>& global_parents) {
+        // Resize global arrays
+        global_distances.resize(V, INF);
+        global_parents.resize(V, -1);
+        
+        // Gather data from all processes using MPI
+        int num_procs;
+        MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+        
+        // Each process sends data only for its local vertices
+        vector<int> send_counts(num_procs, 0);
+        vector<int> recv_counts(num_procs);
+        vector<int> send_displs(num_procs, 0);
+        vector<int> recv_displs(num_procs, 0);
+        
+        // First determine how many vertices each process has
+        int local_count = graph->getLocalVertexCount();
+        MPI_Allgather(&local_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+        
+        // Calculate displacements for gatherv
+        for (int i = 1; i < num_procs; i++) {
+            recv_displs[i] = recv_displs[i-1] + recv_counts[i-1];
+        }
+        
+        // Create buffer for local data
+        struct VertexData {
+            int global_idx;
+            double distance;
+            int parent;
+        };
+        
+        vector<VertexData> local_data(local_count);
+        vector<VertexData> all_data(V);
+        
+        // Fill local data
+        for (int i = 0; i < local_count; i++) {
+            local_data[i].global_idx = graph->getGlobalIndex(i);
+            local_data[i].distance = distance[i];
+            local_data[i].parent = (parent[i] == -1) ? -1 : graph->getGlobalIndex(parent[i]);
+        }
+        
+        // Gather all data
+        MPI_Allgatherv(local_data.data(), local_count * sizeof(VertexData), MPI_BYTE,
+                     all_data.data(), recv_counts.data(), recv_displs.data(), MPI_BYTE,
+                     MPI_COMM_WORLD);
+        
+        // Process gathered data
+        for (const auto& data : all_data) {
+            if (data.global_idx >= 0 && data.global_idx < V) {
+                global_distances[data.global_idx] = data.distance;
+                global_parents[data.global_idx] = data.parent;
+            }
+        }
+    }
+    
+    // Update ghost vertices with values from their owner processes
+    void syncGhostVertices() {
+        // Get ghost vertices
+        vector<int> ghostVertices = graph->getGhostVertices();
+        if (ghostVertices.empty()) return;
+        
+        // For each ghost vertex, request updates from owner
+        int num_procs;
+        MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+        
+        // Group ghost vertices by owner process
+        vector<vector<int>> verticesByProcess(num_procs);
+        
+        for (int ghost : ghostVertices) {
+            int global_idx = graph->getGlobalIndex(ghost);
+            int owner = graph->getOwnerProcess(global_idx);
+            verticesByProcess[owner].push_back(global_idx);
+        }
+        
+        // For each process, request updates for ghost vertices
+        for (int p = 0; p < num_procs; p++) {
+            if (p == rank || verticesByProcess[p].empty()) continue;
+            
+            // Send request to process p
+            int num_vertices = verticesByProcess[p].size();
+            MPI_Send(verticesByProcess[p].data(), num_vertices, MPI_INT, p, 0, MPI_COMM_WORLD);
+            
+            // Receive updates
+            vector<VertexUpdate> updates(num_vertices);
+            MPI_Recv(updates.data(), num_vertices * sizeof(VertexUpdate), MPI_BYTE, p, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            
+            // Apply updates to local ghost vertices
+            for (const auto& update : updates) {
+                int local_idx = graph->getLocalIndex(update.vertex);
+                distance[local_idx] = update.distance;
+                parent[local_idx] = (update.parent == -1) ? -1 : graph->getLocalIndex(update.parent);
+            }
+        }
+        
+        // Listen for requests from other processes
+        for (int p = 0; p < num_procs; p++) {
+            if (p == rank) continue;
+            
+            // Check if there's a request from process p
+            MPI_Status status;
+            int flag = 0;
+            MPI_Iprobe(p, 0, MPI_COMM_WORLD, &flag, &status);
+            
+            if (flag) {
+                // Get message size
+                int count;
+                MPI_Get_count(&status, MPI_INT, &count);
+                
+                // Receive request
+                vector<int> requested_vertices(count);
+                MPI_Recv(requested_vertices.data(), count, MPI_INT, p, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                
+                // Prepare response
+                vector<VertexUpdate> updates;
+                for (int global_idx : requested_vertices) {
+                    int local_idx = graph->getLocalIndex(global_idx);
+                    int local_parent = parent[local_idx];
+                    int global_parent = (local_parent == -1) ? -1 : graph->getGlobalIndex(local_parent);
+                    updates.push_back(VertexUpdate(global_idx, distance[local_idx], global_parent));
                 }
                 
-                // Check if parent is ghost
-                if (parentLocalIdx == -1) {
-                    for (int j = 0; j < graph->numGhostVertices; j++) {
-                        if (graph->ghostVertices[j] == parentGlobalIdx) {
-                            parentLocalIdx = graph->numLocalVertices + j;
-                            break;
-                        }
-                    }
+                // Send response
+                MPI_Send(updates.data(), updates.size() * sizeof(VertexUpdate), MPI_BYTE, p, 1, MPI_COMM_WORLD);
+            }
+        }
+    }
+};
+
+struct PQNode {
+    int vertex;
+    double distance;
+    
+    PQNode(int v, double d) : vertex(v), distance(d) {}
+    
+    // Operator overloading for priority queue
+    bool operator>(const PQNode& other) const {
+        return distance > other.distance;
+    }
+};
+
+// Compute initial SSSP using distributed Dijkstra's algorithm
+SSSPTree computeInitialSSSP(DistributedGraph& graph, int source) {
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    
+    SSSPTree sssp(graph.getVertexCount(), source, &graph, rank);
+    
+    // If source is not in this partition, wait for updates from the process that has the source
+    int local_source = sssp.getLocalSource();
+    bool has_source = (local_source >= 0 && local_source < graph.getLocalVertexCount());
+    
+    // Priority queue for Dijkstra's algorithm
+    priority_queue<PQNode, std::vector<PQNode>, std::greater<PQNode>> pq;
+    vector<bool> processed(graph.getVertexCount(), false);
+    
+    // If this process has the source, initialize it
+    if (has_source) {
+        pq.push(PQNode(local_source, 0));
+    }
+    
+    // Main Dijkstra loop
+    bool global_finished = false;
+    while (!global_finished) {
+        // Process local queue
+        while (!pq.empty()) {
+            int u = pq.top().vertex;
+            pq.pop();
+            
+            if (processed[u]) continue;
+            processed[u] = true;
+            
+            // If this is a ghost vertex, skip processing neighbors
+            if (graph.isGhost(u)) continue;
+            
+            // Check all neighbors
+            for (const Neighbor& neighbor : graph.getNeighbors(u)) {
+                int v = neighbor.vertex;
+                if (processed[v]) continue;
+                
+                double new_dist = sssp.getDistance(u) + neighbor.weight;
+                if (new_dist < sssp.getDistance(v)) {
+                    sssp.setDistance(v, new_dist);
+                    sssp.setParent(v, u);
+                    pq.push(PQNode(v, new_dist));
                 }
             }
-            
-            graph->parent[localIdx] = parentLocalIdx;
-            graph->affected[localIdx] = true;
         }
-    }
-    
-    // Clean up
-    free(sendCounts);
-    free(recvCounts);
-    free(sendDispls);
-    free(recvDispls);
-    free(sendBuffer);
-    free(recvBuffer);
-    free(sendOffset);
-}
-
-void gatherResults(Graph* fullGraph, Graph* localGraph) {
-    // Gather local distances
-    int* allDists = NULL;
-    int* allParents = NULL;
-    
-    if (mpi_rank == 0) {
-        allDists = (int*)malloc(fullGraph->numVertices * sizeof(int));
-        allParents = (int*)malloc(fullGraph->numVertices * sizeof(int));
-    }
-    
-    // Send local distances and parents
-    int* localDists = (int*)malloc(localGraph->numLocalVertices * sizeof(int));
-    int* localParents = (int*)malloc(localGraph->numLocalVertices * sizeof(int));
-    int* globalIndices = (int*)malloc(localGraph->numLocalVertices * sizeof(int));
-    
-    for (int i = 0; i < localGraph->numLocalVertices; i++) {
-        localDists[i] = localGraph->dist[i];
-        globalIndices[i] = localGraph->globalIdx[i];
         
-        // Convert local parent index to global
-        if (localGraph->parent[i] == -1) {
-            localParents[i] = -1;
-        } else if (localGraph->parent[i] < localGraph->numLocalVertices) {
-            localParents[i] = localGraph->globalIdx[localGraph->parent[i]];
-        } else {
-            int ghostIdx = localGraph->parent[i] - localGraph->numLocalVertices;
-            localParents[i] = localGraph->ghostVertices[ghostIdx];
-        }
-    }
-    
-    // Gather counts
-    int* recvCounts = NULL;
-    int* displs = NULL;
-    
-    if (mpi_rank == 0) {
-        recvCounts = (int*)malloc(mpi_size * sizeof(int));
-        displs = (int*)malloc(mpi_size * sizeof(int));
-    }
-    
-    // Gather local vertex counts
-    MPI_Gather(&localGraph->numLocalVertices, 1, MPI_INT, recvCounts, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    
-    // Calculate displacements
-    if (mpi_rank == 0) {
-        displs[0] = 0;
-        for (int i = 1; i < mpi_size; i++) {
-            displs[i] = displs[i-1] + recvCounts[i-1];
-        }
-    }
-    
-    // Gather all data
-    MPI_Gatherv(globalIndices, localGraph->numLocalVertices, MPI_INT,
-               NULL, recvCounts, displs, MPI_INT,
-               0, MPI_COMM_WORLD);
-    
-    MPI_Gatherv(localDists, localGraph->numLocalVertices, MPI_INT,
-               allDists, recvCounts, displs, MPI_INT,
-               0, MPI_COMM_WORLD);
-    
-    MPI_Gatherv(localParents, localGraph->numLocalVertices, MPI_INT,
-               allParents, recvCounts, displs, MPI_INT,
-               0, MPI_COMM_WORLD);
-    
-    // Update full graph on rank 0
-    if (mpi_rank == 0) {
-        for (int p = 0; p < mpi_size; p++) {
-            for (int i = 0; i < recvCounts[p]; i++) {
-                int idx = displs[p] + i;
-                int globalIdx = partitionVertices[p][i];
-                fullGraph->dist[globalIdx] = allDists[idx];
-                fullGraph->parent[globalIdx] = allParents[idx];
+        // Synchronize ghost vertices
+        sssp.syncGhostVertices();
+        
+        // Check if any new vertices need to be processed
+        for (int i = 0; i < graph.getVertexCount(); i++) {
+            if (!processed[i] && sssp.getDistance(i) < INF) {
+                pq.push(PQNode(i, sssp.getDistance(i)));
             }
         }
         
-        free(allDists);
-        free(allParents);
-        free(recvCounts);
-        free(displs);
+        // Check if all processes are done
+        int local_finished = pq.empty() ? 1 : 0;
+        int global_result;
+        MPI_Allreduce(&local_finished, &global_result, 1, MPI_INT, MPI_PROD, MPI_COMM_WORLD);
+        global_finished = (global_result == 1);
     }
     
-    free(localDists);
-    free(localParents);
-    free(globalIndices);
+    return sssp;
 }
 
-void outputSSSP(Graph* graph, int sourceVertex) {
-    printf("SSSP results from vertex %d:\n", sourceVertex);
-    printf("Vertex\tDistance\tParent\n");
+// Identify affected subtree when an edge is deleted
+void identifyDeletedSubtree(SSSPTree& sssp, const Edge& deleted_edge, DistributedGraph& graph) {
+    int local_u = deleted_edge.src;
+    int local_v = deleted_edge.dest;
     
-    for (int i = 0; i < graph->numVertices; i++) {
-        if (graph->dist[i] == INF) {
-            printf("%d\tINF\t-\n", i);
-        } else {
-            printf("%d\t%d\t%d\n", i, graph->dist[i], graph->parent[i]);
+    // Determine which vertex is parent and which is child
+    int parent, child;
+    if (sssp.getParent(local_v) == local_u) {
+        parent = local_u;
+        child = local_v;
+    } else if (sssp.getParent(local_u) == local_v) {
+        parent = local_v;
+        child = local_u;
+    } else {
+        // Edge is not part of the SSSP tree
+        return;
+    }
+    
+    // BFS to mark all vertices in the subtree as affected
+    queue<int> q;
+    q.push(child);
+    sssp.markAffectedByDeletion(child, true);
+    sssp.markAffected(child, true);
+    
+    while (!q.empty()) {
+        int u = q.front();
+        q.pop();
+        
+        // Find all children in the SSSP tree
+        for (int i = 0; i < graph.getVertexCount(); i++) {
+            if (sssp.getParent(i) == u) {
+                sssp.markAffectedByDeletion(i, true);
+                sssp.markAffected(i, true);
+                q.push(i);
+            }
         }
     }
 }
 
-void freeGraph(Graph* graph) {
-    free(graph->xadj);
-    free(graph->adjncy);
-    free(graph->weights);
-    free(graph->dist);
-    free(graph->parent);
-    free(graph->affected);
-    free(graph->affected_del);
+// Process edge insertion
+void processInsertion(SSSPTree& sssp, const Edge& new_edge, DistributedGraph& graph) {
+    int local_u = new_edge.src;
+    int local_v = new_edge.dest;
+    double weight = new_edge.weight;
     
-    if (graph->numGhostVertices > 0) {
-        free(graph->ghostVertices);
-        free(graph->ghostLocalIdx);
-        free(graph->ghostPartition);
-        free(graph->globalIdx);
+    // Check if the new edge can improve distances
+    double dist_u = sssp.getDistance(local_u);
+    double dist_v = sssp.getDistance(local_v);
+    
+    if (dist_u == INF && dist_v == INF) {
+        // Both endpoints unreachable, nothing to do
+        return;
+    }
+    
+    // Check if edge improves distance for u
+    if (dist_v < INF && dist_u > dist_v + weight) {
+        sssp.setDistance(local_u, dist_v + weight);
+        sssp.setParent(local_u, local_v);
+        sssp.markAffected(local_u, true);
+    }
+    
+    // Check if edge improves distance for v
+    if (dist_u < INF && dist_v > dist_u + weight) {
+        sssp.setDistance(local_v, dist_u + weight);
+        sssp.setParent(local_v, local_u);
+        sssp.markAffected(local_v, true);
     }
 }
 
-void freeEdgeSet(EdgeSet* edgeSet) {
-    free(edgeSet->edges);
-} 
-// Global variables for MPI
-
-
-int main(int argc, char* argv[]) {
-    MPI_Init(&argc, &argv);
-    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+// Process affected vertices after edge changes
+void processAffectedVertices(SSSPTree& sssp, DistributedGraph& graph) {
+    // Priority queue for modified Dijkstra
+    priority_queue<PQNode, std::vector<PQNode>, std::greater<PQNode>> pq;
+    vector<bool> in_queue(graph.getVertexCount(), false);
     
-    // Parse command line arguments
+    // Add all affected vertices to the queue
+    for (int i = 0; i < graph.getVertexCount(); i++) {
+        if (sssp.isAffected(i)) {
+            pq.push(PQNode(i, sssp.getDistance(i)));
+            in_queue[i] = true;
+        }
+    }
+    
+    // Process queue
+    while (!pq.empty()) {
+        int u = pq.top().vertex;
+        double dist_u = pq.top().distance;
+        pq.pop();
+        in_queue[u] = false;
+        
+        // Skip if distance has improved since node was queued
+        if (dist_u > sssp.getDistance(u)) continue;
+        
+        // Process neighbors
+        for (const Neighbor& neighbor : graph.getNeighbors(u)) {
+            int v = neighbor.vertex;
+            double weight = neighbor.weight;
+            
+            // Check if distance can be improved
+            double new_dist = sssp.getDistance(u) + weight;
+            if (new_dist < sssp.getDistance(v)) {
+                sssp.setDistance(v, new_dist);
+                sssp.setParent(v, u);
+                
+                // Add to queue if not already in it
+                if (!in_queue[v]) {
+                    pq.push(PQNode(v, new_dist));
+                    in_queue[v] = true;
+                }
+            }
+        }
+    }
+    
+    // Reset affected flags
+    for (int i = 0; i < graph.getVertexCount(); i++) {
+        sssp.markAffected(i, false);
+        sssp.markAffectedByDeletion(i, false);
+    }
+}
+
+// Process a batch of edge changes
+void processEdgeChanges(SSSPTree& sssp, const vector<EdgeChange>& changes, DistributedGraph& graph) {
+    // First process all deletions
+    for (const auto& change : changes) {
+        if (!change.isInsertion) {
+            // Remove edge from graph
+            graph.removeEdge(change.edge.src, change.edge.dest);
+            
+            // Check if edge is part of SSSP tree
+            if (sssp.isTreeEdge(change.edge.src, change.edge.dest)) {
+                identifyDeletedSubtree(sssp, change.edge, graph);
+            }
+        }
+    }
+    
+    // Reset distances for affected vertices
+    for (int i = 0; i < graph.getVertexCount(); i++) {
+        if (sssp.isAffectedByDeletion(i)) {
+            sssp.setDistance(i, INF);
+            sssp.setParent(i, -1);
+        }
+    }
+    
+    // Then process all insertions
+    for (const auto& change : changes) {
+        if (change.isInsertion) {
+            // Add edge to graph
+            graph.addEdge(change.edge.src, change.edge.dest, change.edge.weight);
+            
+            // Process insertion
+            processInsertion(sssp, change.edge, graph);
+        }
+    }
+    
+    // Process all affected vertices
+    processAffectedVertices(sssp, graph);
+    
+    // Synchronize ghost vertices
+    sssp.syncGhostVertices();
+}
+
+// Load batch changes from file
+vector<EdgeChange> loadChangesFromFile(const string& filePath) {
+    vector<EdgeChange> changes;
+    ifstream file(filePath);
+    
+    if (!file.is_open()) {
+        throw runtime_error("Could not open changes file: " + filePath);
+    }
+    
+    string line;
+    // Skip comment lines
+    while (getline(file, line) && line[0] == '#') {}
+    
+    // Read number of changes
+    int numChanges = stoi(line);
+    
+    // Read each change
+    for (int i = 0; i < numChanges; i++) {
+        if (getline(file, line)) {
+            istringstream lineStream(line);
+            char changeType;
+            int u, v;
+            double weight;
+            
+            lineStream >> changeType >> u >> v >> weight;
+            
+            // Convert to 0-based indexing
+            u--;
+            v--;
+            
+            // Create change object
+            bool isInsertion = (changeType == '+' || changeType == 'a');
+            changes.push_back(EdgeChange(u, v, weight, isInsertion));
+        }
+    }
+    
+    file.close();
+    return changes;
+}
+
+int main(int argc, char** argv) {
+    // Initialize MPI
+    MPI_Init(&argc, &argv);
+    
+    int rank, num_procs;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+    
     if (argc < 4) {
-        if (mpi_rank == 0) {
-            printf("Usage: %s <graph_file> <source_vertex> <changes_file> [num_threads]\n", argv[0]);
+        if (rank == 0) {
+            cerr << "Usage: " << argv[0] << " <graph_file> <source_vertex> <changes_file> [output_file]" << endl;
         }
         MPI_Finalize();
         return 1;
     }
     
-    char* graphFile = argv[1];
-    int sourceVertex = atoi(argv[2]);
-    char* changesFile = argv[3];
+    string graphFile = argv[1];
+    int sourceVertex = stoi(argv[2]) - 1;  // Convert to 0-based indexing
+    string changesFile = argv[3];
+    string outputFile = (argc > 4) ? argv[4] : "sssp_result.txt";
     
-    // Set number of OpenMP threads
-    int numThreads = omp_get_max_threads();
-    if (argc > 4) {
-        numThreads = atoi(argv[4]);
-    }
-    omp_set_num_threads(numThreads);
-    
-    // Master process reads the input and partitions the graph
-    Graph fullGraph;
-    EdgeSet deletedEdges, insertedEdges;
-    
-    if (mpi_rank == 0) {
-        printf("Reading graph from %s\n", graphFile);
-        readGraph(&fullGraph, graphFile);
+    try {
+        // Load graph (all processes load the full graph first)
+        Graph fullGraph = Graph::fromMetisFile(graphFile);
+        int V = fullGraph.getVertexCount();
         
-        printf("Reading changes from %s\n", changesFile);
-        readChanges(changesFile, &deletedEdges, &insertedEdges);
+        // Partition graph using METIS
+        vector<int> partition;
+        if (rank == 0) {
+            partition = fullGraph.partitionWithMetis(num_procs);
+            
+            // Print partition info
+            cout << "Graph partitioned into " << num_procs << " parts." << endl;
+            
+            // Count vertices in each partition
+            vector<int> partitionCounts(num_procs, 0);
+            for (int p : partition) {
+                partitionCounts[p]++;
+            }
+            
+            for (int i = 0; i < num_procs; i++) {
+                cout << "Partition " << i << ": " << partitionCounts[i] << " vertices" << endl;
+            }
+        }
         
-        printf("Initializing SSSP from vertex %d\n", sourceVertex);
-        initializeSSSP(&fullGraph, sourceVertex);
+        // Broadcast partition to all processes
+        if (rank == 0) {
+            for (int p = 1; p < num_procs; p++) {
+                MPI_Send(partition.data(), V, MPI_INT, p, 0, MPI_COMM_WORLD);
+            }
+        } else {
+            partition.resize(V);
+            MPI_Recv(partition.data(), V, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
         
-        printf("Partitioning graph into %d parts\n", mpi_size);
-        partitionGraph(&fullGraph, mpi_size);
+        // Create distributed graph for this process
+        DistributedGraph distGraph(V, rank, num_procs);
+        distGraph.initializeFromPartition(partition, fullGraph);
+        
+        // Start timer
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        // Compute initial SSSP
+        SSSPTree sssp = computeInitialSSSP(distGraph, sourceVertex);
+        
+        // Load changes
+        vector<EdgeChange> changes;
+        if (rank == 0) {
+            changes = loadChangesFromFile(changesFile);
+            
+            // Print changes info
+            cout << "Loaded " << changes.size() << " edge changes." << endl;
+            
+            // Broadcast changes to all processes
+            int numChanges = changes.size();
+            for (int p = 1; p < num_procs; p++) {
+                MPI_Send(&numChanges, 1, MPI_INT, p, 0, MPI_COMM_WORLD);
+                MPI_Send(changes.data(), numChanges * sizeof(EdgeChange), MPI_BYTE, p, 1, MPI_COMM_WORLD);
+            }
+        } else {
+            // Receive changes from process 0
+            int numChanges;
+            MPI_Recv(&numChanges, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            
+            changes.resize(numChanges);
+            MPI_Recv(changes.data(), numChanges * sizeof(EdgeChange), MPI_BYTE, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        
+        // Process changes
+        processEdgeChanges(sssp, changes, distGraph);
+        
+        // Compute runtime
+        auto end_time = chrono::high_resolution_clock::now();
+        double runtime = chrono::duration<double>(end_time - start_time).count();
+        
+        // Gather runtime statistics
+        double max_runtime;
+        MPI_Reduce(&runtime, &max_runtime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        
+        if (rank == 0) {
+            cout << "Total runtime: " << max_runtime << " seconds" << endl;
+        }
+        
+        // Save result to file
+        sssp.saveToFile(outputFile);
+        
+    } catch (const exception& e) {
+        if (rank == 0) {
+            cerr << "Error: " << e.what() << endl;
+        }
+        MPI_Finalize();
+        return 1;
     }
     
-    // Allocate memory for partition information
-    vertexToPartition = (int*)malloc(fullGraph.numVertices * sizeof(int));
-    partitionSizes = (int*)malloc(mpi_size * sizeof(int));
-    partitionVertices = (int**)malloc(mpi_size * sizeof(int*));
-    partitionNeighbors = (int**)malloc(mpi_size * sizeof(int*));
-    numPartitionNeighbors = (int*)malloc(mpi_size * sizeof(int));
-    
-    // Broadcast initial partition information
-    MPI_Bcast(partitionSizes, mpi_size, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(vertexToPartition, fullGraph.numVertices, MPI_INT, 0, MPI_COMM_WORLD);
-    
-    // Allocate memory for partition vertices
-    for (int p = 0; p < mpi_size; p++) {
-        partitionVertices[p] = (int*)malloc(partitionSizes[p] * sizeof(int));
-    }
-    
-    // Distribute graph partitions
-    Graph localGraph;
-    distributeGraphPartitions(&fullGraph, &localGraph);
-    
-    // Main algorithm steps
-    MPI_Barrier(MPI_COMM_WORLD);
-    double startTime = MPI_Wtime();
-    
-    processChangedEdges(&localGraph, &deletedEdges, &insertedEdges);
-    updateAffectedVertices(&localGraph);
-    
-    MPI_Barrier(MPI_COMM_WORLD);
-    double endTime = MPI_Wtime();
-    
-    if (mpi_rank == 0) {
-        printf("SSSP update took %.6f seconds\n", endTime - startTime);
-    }
-    
-    // Gather results back to rank 0
-    gatherResults(&fullGraph, &localGraph);
-    
-    // Output results
-    if (mpi_rank == 0) {
-        outputSSSP(&fullGraph, sourceVertex);
-    }
-    
-    // Clean up
-    freeGraph(&localGraph);
-    if (mpi_rank == 0) {
-        freeGraph(&fullGraph);
-        freeEdgeSet(&deletedEdges);
-        freeEdgeSet(&insertedEdges);
-    }
-    
-    // Free partition information
-    for (int p = 0; p < mpi_size; p++) {
-        free(partitionVertices[p]);
-        free(partitionNeighbors[p]);
-    }
-    free(partitionVertices);
-    free(partitionNeighbors);
-    free(partitionSizes);
-    free(numPartitionNeighbors);
-    free(vertexToPartition);
-    
+    // Finalize MPI
     MPI_Finalize();
     return 0;
-}
-
-void readGraph(Graph* graph, char* filename) {
-    FILE* file = fopen(filename, "r");
-    if (file == NULL) {
-        fprintf(stderr, "Error opening file %s\n", filename);
-        exit(1);
-    }
-    
-    // First line contains number of vertices and edges
-    fscanf(file, "%d %d", &graph->numVertices, &graph->numEdges);
-    
-    // Allocate memory for CSR format
-    graph->xadj = (int*)malloc((graph->numVertices + 1) * sizeof(int));
-    graph->adjncy = (int*)malloc(graph->numEdges * sizeof(int));
-    graph->weights = (int*)malloc(graph->numEdges * sizeof(int));
-    
-    // Temporary arrays for edge list
-    int* edgeCount = (int*)calloc(graph->numVertices, sizeof(int));
-    Edge* edges = (Edge*)malloc(graph->numEdges * sizeof(Edge));
-    
-    // Read edges
-    for (int i = 0; i < graph->numEdges; i++) {
-        fscanf(file, "%d %d %d", &edges[i].source, &edges[i].target, &edges[i].weight);
-        edgeCount[edges[i].source]++;
-    }
-    
-    // Set up CSR format
-    graph->xadj[0] = 0;
-    for (int i = 0; i < graph->numVertices; i++) {
-        graph->xadj[i + 1] = graph->xadj[i] + edgeCount[i];
-    }
-    
-    // Reset edge count for building adjacency list
-    memset(edgeCount, 0, graph->numVertices * sizeof(int));
-    
-    // Fill adjacency list
-    for (int i = 0; i < graph->numEdges; i++) {
-        int src = edges[i].source;
-        int idx = graph->xadj[src] + edgeCount[src];
-        graph->adjncy[idx] = edges[i].target;
-        graph->weights[idx] = edges[i].weight;
-        edgeCount[src]++;
-    }
-    
-    // Allocate memory for SSSP data structures
-    graph->dist = (int*)malloc(graph->numVertices * sizeof(int));
-    graph->parent = (int*)malloc(graph->numVertices * sizeof(int));
-    graph->affected = (bool*)malloc(graph->numVertices * sizeof(bool));
-    graph->affected_del = (bool*)malloc(graph->numVertices * sizeof(bool));
-    
-    // Initialize
-    for (int i = 0; i < graph->numVertices; i++) {
-        graph->dist[i] = INF;
-        graph->parent[i] = -1;
-        graph->affected[i] = false;
-        graph->affected_del[i] = false;
-    }
-    
-    // Clean up
-    free(edges);
-    free(edgeCount);
-    fclose(file);
-}
-
-void readChanges(char* filename, EdgeSet* deletedEdges, EdgeSet* insertedEdges) {
-    FILE* file = fopen(filename, "r");
-    if (file == NULL) {
-        fprintf(stderr, "Error opening file %s\n", filename);
-        exit(1);
-    }
-    
-    int numDeleted, numInserted;
-    fscanf(file, "%d %d", &numDeleted, &numInserted);
-    
-    // Allocate memory for edge sets
-    deletedEdges->count = numDeleted;
-    deletedEdges->edges = (Edge*)malloc(numDeleted * sizeof(Edge));
-    
-    insertedEdges->count = numInserted;
-    insertedEdges->edges = (Edge*)malloc(numInserted * sizeof(Edge));
-    
-    // Read deleted edges
-    for (int i = 0; i < numDeleted; i++) {
-        fscanf(file, "%d %d %d", &deletedEdges->edges[i].source, 
-               &deletedEdges->edges[i].target, &deletedEdges->edges[i].weight);
-    }
-    
-    // Read inserted edges
-    for (int i = 0; i < numInserted; i++) {
-        fscanf(file, "%d %d %d", &insertedEdges->edges[i].source, 
-               &insertedEdges->edges[i].target, &insertedEdges->edges[i].weight);
-    }
-    
-    fclose(file);
-}
-
-void initializeSSSP(Graph* graph, int sourceVertex) {
-    // Initialize all distances to infinity
-    for (int i = 0; i < graph->numVertices; i++) {
-        graph->dist[i] = INF;
-        graph->parent[i] = -1;
-    }
-    
-    // Set source vertex distance to 0
-    graph->dist[sourceVertex] = 0;
-    
-    // Use Dijkstra's algorithm to compute initial SSSP
-    bool* visited = (bool*)calloc(graph->numVertices, sizeof(bool));
-    
-    for (int i = 0; i < graph->numVertices; i++) {
-        // Find vertex with minimum distance
-        int minDist = INF;
-        int u = -1;
-        
-        for (int v = 0; v < graph->numVertices; v++) {
-            if (!visited[v] && graph->dist[v] < minDist) {
-                minDist = graph->dist[v];
-                u = v;
-            }
-        }
-        
-        if (u == -1) break;  // No more reachable vertices
-        
-        visited[u] = true;
-        
-        // Update distances of neighbors
-        for (int j = graph->xadj[u]; j < graph->xadj[u + 1]; j++) {
-            int v = graph->adjncy[j];
-            int weight = graph->weights[j];
-            
-            if (!visited[v] && graph->dist[u] != INF && 
-                graph->dist[u] + weight < graph->dist[v]) {
-                graph->dist[v] = graph->dist[u] + weight;
-                graph->parent[v] = u;
-            }
-        }
-    }
-    
-    free(visited);
-}
-
-void partitionGraph(Graph* graph, int numPartitions) {
-    // Allocate memory for METIS input
-    idx_t nvtxs = graph->numVertices;
-    idx_t ncon = 1;  // Number of balancing constraints
-    idx_t* xadj = (idx_t*)malloc((nvtxs + 1) * sizeof(idx_t));
-    idx_t* adjncy = (idx_t*)malloc(graph->numEdges * sizeof(idx_t));
-    idx_t* adjwgt = (idx_t*)malloc(graph->numEdges * sizeof(idx_t));
-    
-    // Convert graph to METIS format
-    for (int i = 0; i <= nvtxs; i++) {
-        xadj[i] = graph->xadj[i];
-    }
-    
-    for (int i = 0; i < graph->numEdges; i++) {
-        adjncy[i] = graph->adjncy[i];
-        adjwgt[i] = graph->weights[i];
-    }
-    
-    // Allocate memory for partition result
-    idx_t* part = (idx_t*)malloc(nvtxs * sizeof(idx_t));
-    idx_t edgecut;
-    idx_t nparts = numPartitions;
-    
-    // Set METIS options
-    idx_t options[METIS_NOPTIONS];
-    METIS_SetDefaultOptions(options);
-    options[METIS_OPTION_OBJTYPE] = METIS_OBJTYPE_CUT;
-    
-    // Call METIS to partition the graph
-    int ret = METIS_PartGraphKway(&nvtxs, &ncon, xadj, adjncy, NULL, NULL, 
-                          adjwgt, &nparts, NULL, NULL, options, 
-                          &edgecut, part);
-    
-    if (ret != METIS_OK) {
-        fprintf(stderr, "METIS_PartGraphKway returned error code %d\n", ret);
-        exit(1);
-    }
-    
-    // Copy partition results
-    for (int i = 0; i < nvtxs; i++) {
-        vertexToPartition[i] = part[i];
-    }
-    
-    // Count vertices in each partition
-    memset(partitionSizes, 0, numPartitions * sizeof(int));
-    for (int i = 0; i < nvtxs; i++) {
-        partitionSizes[part[i]]++;
-    }
-    
-    // Allocate partition vertices
-    for (int p = 0; p < numPartitions; p++) {
-        partitionVertices[p] = (int*)malloc(partitionSizes[p] * sizeof(int));
-    }
-    
-    // Fill partition vertices
-    int* partitionCounts = (int*)calloc(numPartitions, sizeof(int));
-    for (int i = 0; i < nvtxs; i++) {
-        int p = part[i];
-        partitionVertices[p][partitionCounts[p]++] = i;
-    }
-    
-    // Determine neighboring partitions
-    bool** isNeighbor = (bool**)malloc(numPartitions * sizeof(bool*));
-    for (int p = 0; p < numPartitions; p++) {
-        isNeighbor[p] = (bool*)calloc(numPartitions, sizeof(bool));
-    }
-    
-    for (int u = 0; u < nvtxs; u++) {
-        int pu = part[u];
-        for (int j = xadj[u]; j < xadj[u + 1]; j++) {
-            int v = adjncy[j];
-            int pv = part[v];
-            if (pu != pv) {
-                isNeighbor[pu][pv] = true;
-            }
-        }
-    }
-    
-    // Count and allocate neighboring partitions
-    for (int p = 0; p < numPartitions; p++) {
-        numPartitionNeighbors[p] = 0;
-        for (int q = 0; q < numPartitions; q++) {
-            if (isNeighbor[p][q]) {
-                numPartitionNeighbors[p]++;
-            }
-        }
-        
-        partitionNeighbors[p] = (int*)malloc(numPartitionNeighbors[p] * sizeof(int));
-        
-        int idx = 0;
-        for (int q = 0; q < numPartitions; q++) {
-            if (isNeighbor[p][q]) {
-                partitionNeighbors[p][idx++] = q;
-            }
-        }
-    }
-    
-    // Clean up
-    free(xadj);
-    free(adjncy);
-    free(adjwgt);
-    free(part);
-    free(partitionCounts);
-    for (int p = 0; p < numPartitions; p++) {
-        free(isNeighbor[p]);
-    }
-    free(isNeighbor);
-}
-
-void distributeGraphPartitions(Graph* fullGraph, Graph* localGraph) {
-    // Initialize local graph
-    localGraph->numLocalVertices = partitionSizes[mpi_rank];
-    localGraph->globalIdx = (int*)malloc(localGraph->numLocalVertices * sizeof(int));
-    
-    // Copy global indices of local vertices
-    memcpy(localGraph->globalIdx, partitionVertices[mpi_rank], 
-           localGraph->numLocalVertices * sizeof(int));
-    
-    // Count local edges and build ghost vertex list
-    int numLocalEdges = 0;
-    bool* isGhost = (bool*)calloc(fullGraph->numVertices, sizeof(bool));
-    int* ghostGlobalToLocal = (int*)malloc(fullGraph->numVertices * sizeof(int));
-    int numGhosts = 0;
-    
-    for (int i = 0; i < localGraph->numLocalVertices; i++) {
-        int u = localGraph->globalIdx[i];
-        for (int j = fullGraph->xadj[u]; j < fullGraph->xadj[u + 1]; j++) {
-            int v = fullGraph->adjncy[j];
-            if (vertexToPartition[v] != mpi_rank && !isGhost[v]) {
-                isGhost[v] = true;
-                ghostGlobalToLocal[v] = numGhosts++;
-            }
-            numLocalEdges++;
-        }
-    }
-    
-    // Initialize local graph data structures
-    localGraph->numVertices = localGraph->numLocalVertices + numGhosts;
-    localGraph->numEdges = numLocalEdges;
-    localGraph->numGhostVertices = numGhosts;
-    
-    localGraph->xadj = (int*)malloc((localGraph->numVertices + 1) * sizeof(int));
-    localGraph->adjncy = (int*)malloc(localGraph->numEdges * sizeof(int));
-    localGraph->weights = (int*)malloc(localGraph->numEdges * sizeof(int));
-    
-    localGraph->ghostVertices = (int*)malloc(numGhosts * sizeof(int));
-    localGraph->ghostLocalIdx = (int*)malloc(numGhosts * sizeof(int));
-    localGraph->ghostPartition = (int*)malloc(numGhosts * sizeof(int));
-    
-    // Fill ghost vertex information
-    numGhosts = 0;
-    for (int i = 0; i < fullGraph->numVertices; i++) {
-        if (isGhost[i]) {
-            localGraph->ghostVertices[numGhosts] = i;
-            localGraph->ghostLocalIdx[numGhosts] = localGraph->numLocalVertices + numGhosts;
-            localGraph->ghostPartition[numGhosts] = vertexToPartition[i];
-            numGhosts++;
-        }
-    }
-    
-    // Build local graph
-    localGraph->xadj[0] = 0;
-    int edgeIdx = 0;
-    
-    for (int i = 0; i < localGraph->numLocalVertices; i++) {
-        int u = localGraph->globalIdx[i];
-        for (int j = fullGraph->xadj[u]; j < fullGraph->xadj[u + 1]; j++) {
-            int v = fullGraph->adjncy[j];
-            int localV;
-            
-            if (vertexToPartition[v] == mpi_rank) {
-                // Find local index of v
-                for (int k = 0; k < localGraph->numLocalVertices; k++) {
-                    if (localGraph->globalIdx[k] == v) {
-                        localV = k;
-                        break;
-                    }
-                }
-            } else {
-                // Ghost vertex
-                localV = localGraph->numLocalVertices + ghostGlobalToLocal[v];
-            }
-            
-            localGraph->adjncy[edgeIdx] = localV;
-            localGraph->weights[edgeIdx] = fullGraph->weights[j];
-            edgeIdx++;
-        }
-        
-        localGraph->xadj[i + 1] = edgeIdx;
-    }
-    
-    // Complete xadj for ghost vertices
-    for (int i = localGraph->numLocalVertices; i < localGraph->numVertices; i++) {
-        localGraph->xadj[i + 1] = localGraph->xadj[i];
-    }
-    
-    // Allocate and initialize SSSP data structures
-    localGraph->dist = (int*)malloc(localGraph->numVertices * sizeof(int));
-    localGraph->parent = (int*)malloc(localGraph->numVertices * sizeof(int));
-    localGraph->affected = (bool*)malloc(localGraph->numVertices * sizeof(bool));
-    localGraph->affected_del = (bool*)malloc(localGraph->numVertices * sizeof(bool));
-    
-    // Initialize local vertices
-    for (int i = 0; i < localGraph->numLocalVertices; i++) {
-        int u = localGraph->globalIdx[i];
-        localGraph->dist[i] = fullGraph->dist[u];
-        
-        // Convert global parent to local index
-        if (fullGraph->parent[u] != -1) {
-            int parentGlobal = fullGraph->parent[u];
-            int parentLocal = -1;
-            
-            if (vertexToPartition[parentGlobal] == mpi_rank) {
-                // Find local index of parent
-                for (int k = 0; k < localGraph->numLocalVertices; k++) {
-                    if (localGraph->globalIdx[k] == parentGlobal) {
-                        parentLocal = k;
-                        break;
-                    }
-                }
-            } else {
-                // Ghost vertex
-                parentLocal = localGraph->numLocalVertices + ghostGlobalToLocal[parentGlobal];
-            }
-            
-            localGraph->parent[i] = parentLocal;
-        } else {
-            localGraph->parent[i] = -1;
-        }
-        
-        localGraph->affected[i] = false;
-        localGraph->affected_del[i] = false;
-    }
-    
-    // Initialize ghost vertices
-    for (int i = 0; i < numGhosts; i++) {
-        int idx = localGraph->numLocalVertices + i;
-        int ghostGlobal = localGraph->ghostVertices[i];
-        
-        localGraph->dist[idx] = fullGraph->dist[ghostGlobal];
-        
-        // Convert global parent to local index
-        if (fullGraph->parent[ghostGlobal] != -1) {
-            int parentGlobal = fullGraph->parent[ghostGlobal];
-            int parentLocal = -1;
-            
-            if (vertexToPartition[parentGlobal] == mpi_rank) {
-                // Find local index of parent
-                for (int k = 0; k < localGraph->numLocalVertices; k++) {
-                    if (localGraph->globalIdx[k] == parentGlobal) {
-                        parentLocal = k;
-                        break;
-                    }
-                }
-            } else if (isGhost[parentGlobal]) {
-                // Ghost vertex
-                parentLocal = localGraph->numLocalVertices + ghostGlobalToLocal[parentGlobal];
-            }
-            
-            localGraph->parent[idx] = parentLocal;
-        } else {
-            localGraph->parent[idx] = -1;
-        }
-        
-        localGraph->affected[idx] = false;
-        localGraph->affected_del[idx] = false;
-    }
-    
-    // Clean up
-    free(isGhost);
-    free(ghostGlobalToLocal);
-}
-
-void processChangedEdges(Graph* graph, EdgeSet* deletedEdges, EdgeSet* insertedEdges) {
-    // Initialize affected arrays
-    #pragma omp parallel for
-    for (int i = 0; i < graph->numVertices; i++) {
-        graph->affected[i] = false;
-        graph->affected_del[i] = false;
-    }
-    
-    // Process edge deletions
-    #pragma omp parallel for
-    for (int i = 0; i < deletedEdges->count; i++) {
-        Edge e = deletedEdges->edges[i];
-        int uLocal = -1, vLocal = -1;
-        
-        // Find local indices of u and v
-        for (int j = 0; j < graph->numLocalVertices; j++) {
-            if (graph->globalIdx[j] == e.source) {
-                uLocal = j;
-            }
-            if (graph->globalIdx[j] == e.target) {
-                vLocal = j;
-            }
-        }
-        
-        // If either vertex is not local, continue
-        if (uLocal == -1 && vLocal == -1) continue;
-        
-        // If one vertex is not local, check if it's a ghost
-        if (uLocal == -1) {
-            for (int j = 0; j < graph->numGhostVertices; j++) {
-                if (graph->ghostVertices[j] == e.source) {
-                    uLocal = graph->numLocalVertices + j;
-                    break;
-                }
-            }
-        }
-        
-        if (vLocal == -1) {
-            for (int j = 0; j < graph->numGhostVertices; j++) {
-                if (graph->ghostVertices[j] == e.target) {
-                    vLocal = graph->numLocalVertices + j;
-                    break;
-                }
-            }
-        }
-        
-        // If we still don't have both vertices, skip
-        if (uLocal == -1 || vLocal == -1) continue;
-        
-        // Check if edge is in SSSP tree
-        if ((graph->parent[vLocal] == uLocal) || (graph->parent[uLocal] == vLocal)) {
-            int y = (graph->dist[uLocal] > graph->dist[vLocal]) ? uLocal : vLocal;
-            graph->dist[y] = INF;
-            graph->affected_del[y] = true;
-            graph->affected[y] = true;
-        }
-    }
-    
-    // Process edge insertions
-    #pragma omp parallel for
-    for (int i = 0; i < insertedEdges->count; i++) {
-        Edge e = insertedEdges->edges[i];
-        int uLocal = -1, vLocal = -1;
-        
-        // Find local indices of u and v
-        for (int j = 0; j < graph->numLocalVertices; j++) {
-            if (graph->globalIdx[j] == e.source) {
-                uLocal = j;
-            }
-            if (graph->globalIdx[j] == e.target) {
-                vLocal = j;
-            }
-        }
-        
-        // If either vertex is not local, continue
-        if (uLocal == -1 && vLocal == -1) continue;
-        
-        // If one vertex is not local, check if it's a ghost
-        if (uLocal == -1) {
-            for (int j = 0; j < graph->numGhostVertices; j++) {
-                if (graph->ghostVertices[j] == e.source) {
-                    uLocal = graph->numLocalVertices + j;
-                    break;
-                }
-            }
-        }
-        
-        if (vLocal == -1) {
-            for (int j = 0; j < graph->numGhostVertices; j++) {
-                if (graph->ghostVertices[j] == e.target) {
-                    vLocal = graph->numLocalVertices + j;
-                    break;
-                }
-            }
-        }
-        
-        // If we still don't have both vertices, skip
-        if (uLocal == -1 || vLocal == -1) continue;
-        
-        int x, y;
-        if (graph->dist[uLocal] > graph->dist[vLocal]) {
-            x = vLocal;
-            y = uLocal;
-        } else {
-            x = uLocal;
-            y = vLocal;
-        }
-        
-        if (graph->dist[y] > graph->dist[x] + e.weight) {
-            graph->dist[y] = graph->dist[x] + e.weight;
-            graph->parent[y] = x;
-            graph->affected[y] = true;
-        }
-    }
-}
-
-void updateAffectedVertices(Graph* graph) {
-    bool hasAffectedDel = true;
-    bool hasAffected = true;
-    
-    // Update vertices affected by deletion
-    while (hasAffectedDel) {
-        hasAffectedDel = false;
-        
-        #pragma omp parallel
-        {
-            bool localHasAffectedDel = false;
-            
-            #pragma omp for schedule(dynamic)
-            for (int v = 0; v < graph->numVertices; v++) {
-                if (graph->affected_del[v]) {
-                    graph->affected_del[v] = false;
-                    
-                    // Process all children of v in the SSSP tree
-                    for (int i = graph->xadj[v]; i < graph->xadj[v+1]; i++) {
-                        int c = graph->adjncy[i];
-                        if (graph->parent[c] == v) {
-                            graph->dist[c] = INF;
-                            graph->affected_del[c] = true;
-                            graph->affected[c] = true;
-                            localHasAffectedDel = true;
-                        }
-                    }
-                }
-            }
-            
-            #pragma omp critical
-            {
-                if (localHasAffectedDel) hasAffectedDel = true;
-            }
-        }
-        
-        // Synchronize across MPI processes
-        int localHasAffectedDel = hasAffectedDel ? 1 : 0;
-        int globalHasAffectedDel = 0;
-        MPI_Allreduce(&localHasAffectedDel, &globalHasAffectedDel, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
-        hasAffectedDel = (globalHasAffectedDel != 0);
-        
-        // Exchange ghost vertex data
-        if (hasAffectedDel) {
-            exchangeGhostVertexData(graph);
-        }
-    }
-    
-    // Update distances of affected vertices
-    while (hasAffected) {
-        hasAffected = false;
-        
-        #pragma omp parallel
-        {
-            bool localHasAffected = false;
-            
-            #pragma omp for schedule(dynamic)
-            for (int v = 0; v < graph->numVertices; v++) {
-                if (graph->affected[v]) {
-                    graph->affected[v] = false;
-                    
-                    // Check all neighbors
-                    for (int i = graph->xadj[v]; i < graph->xadj[v+1]; i++) {
-                        int n = graph->adjncy[i];
-                        int weight = graph->weights[i];
-                        
-                        // If v can improve n
-                        if (graph->dist[v] != INF && 
-                            graph->dist[n] > graph->dist[v] + weight) {
-                            graph->dist[n] = graph->dist[v] + weight;
-                            graph->parent[n] = v;
-                            graph->affected[n] = true;
-                            localHasAffected = true;
-                        }
-                        
-                        // If n can improve v
-                        if (graph->dist[n] != INF && 
-                            graph->dist[v] > graph->dist[n] + weight) {
-                            graph->dist[v] = graph->dist[n] + weight;
-                            graph->parent[v] = n;
-                            graph->affected[v] = true;
-                            localHasAffected = true;
-                        }
-                    }
-                }
-            }
-            
-            #pragma omp critical
-            {
-                if (localHasAffected) hasAffected = true;
-            }
-        }
-        
-        // Synchronize across MPI processes
-        int localHasAffected = hasAffected ? 1 : 0;
-        int globalHasAffected = 0;
-        MPI_Allreduce(&localHasAffected, &globalHasAffected, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
-        hasAffected = (globalHasAffected != 0);
-        
-        // Exchange ghost vertex data
-        if (hasAffected) {
-            exchangeGhostVertexData(graph);
-        }
-    }
 }
