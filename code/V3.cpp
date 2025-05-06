@@ -314,6 +314,15 @@ void partitionGraph(const Graph& graph, int nparts, vector<int>& part) {
     vector<idx_t> adjncy;
     vector<idx_t> part_vec(nvtxs, 0);
     
+    // Handle the case where nparts = 1 (no partitioning needed)
+    if (nparts == 1) {
+        for (int i = 0; i < nvtxs; i++) {
+            part_vec[i] = 0; // Assign all vertices to partition 0
+        }
+        part.assign(part_vec.begin(), part_vec.end());
+        return;
+    }
+    
     // Build CSR format for METIS
     int adjncy_size = 0;
     for (int i = 0; i < nvtxs; i++) {
@@ -411,7 +420,7 @@ void identifyAffectedVertices(Graph& graph, SSSPTree& sssp, const vector<EdgeCha
     int num_changes = changes.size();
     for (int start = 0; start < num_changes; start += batch_size) {
         int end = min(start + batch_size, num_changes);
-        #pragma omp parallel for schedule(dynamic)
+        #pragma omp parallel for schedule(static)
         for (int i = start; i < end; i++) {
             const auto& change = changes[i];
             int u = change.edge.src;
@@ -421,20 +430,26 @@ void identifyAffectedVertices(Graph& graph, SSSPTree& sssp, const vector<EdgeCha
                 if (!change.isInsertion) {
                     if (sssp.isTreeEdge(u, v)) {
                         int y = (sssp.getDistance(u) > sssp.getDistance(v)) ? u : v;
-                        sssp.setDistance(y, INF);
-                        sssp.markAffectedByDeletion(y, true);
-                        sssp.markAffected(y, true);
+                        #pragma omp critical
+                        {
+                            sssp.setDistance(y, INF);
+                            sssp.markAffectedByDeletion(y, true);
+                            sssp.markAffected(y, true);
+                        }
+                        graph.removeEdge(u, v);
                     }
-                    graph.removeEdge(u, v);
                 } else {
                     double weight = change.edge.weight;
                     int x = (sssp.getDistance(u) > sssp.getDistance(v)) ? v : u;
                     int y = (x == u) ? v : u;
                     
                     if (sssp.getDistance(y) > sssp.getDistance(x) + weight) {
-                        sssp.setDistance(y, sssp.getDistance(x) + weight);
-                        sssp.setParent(y, x);
-                        sssp.markAffected(y, true);
+                        #pragma omp critical
+                        {
+                            sssp.setDistance(y, sssp.getDistance(x) + weight);
+                            sssp.setParent(y, x);
+                            sssp.markAffected(y, true);
+                        }
                     }
                     graph.addEdge(u, v, weight);
                 }
@@ -442,7 +457,6 @@ void identifyAffectedVertices(Graph& graph, SSSPTree& sssp, const vector<EdgeCha
         }
     }
 }
-
 // Parallel update affected vertices with OpenMP and asynchronous updates
 void updateAffectedVertices(const Graph& graph, SSSPTree& sssp, const vector<int>& part, int rank, int async_level) {
     int V = sssp.getVertexCount();

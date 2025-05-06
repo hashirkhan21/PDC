@@ -68,3 +68,53 @@ Changes: 10000
 Initial SSSP Time (ms): 2964
 Update SSSP Time (ms): 87312
 ----------------------------------------
+MPI Processes: 4
+OpenMP Threads: 4
+Batch Size: 1000
+Async Level: 4
+Vertices: 75888
+Edges: 508062
+Changes: 10000
+Initial SSSP Time (ms): 3089
+Update SSSP Time (ms): 84752
+----------------------------------------
+MPI Processes: 1
+OpenMP Threads: 2
+Batch Size: 1000
+Async Level: 2
+Vertices: 75888
+Edges: 508062
+Changes: 10000
+Initial SSSP Time (ms): 925
+Update SSSP Time (ms): 113694
+----------------------------------------
+MPI Processes: 1
+OpenMP Threads: 2
+Batch Size: 1000
+Async Level: 2
+Vertices: 75888
+Edges: 508062
+Changes: 10000
+Initial SSSP Time (ms): 922
+Update SSSP Time (ms): 44
+----------------------------------------
+MPI Processes: 1
+OpenMP Threads: 4
+Batch Size: 1000
+Async Level: 2
+Vertices: 75888
+Edges: 508062
+Changes: 10000
+Initial SSSP Time (ms): 940
+Update SSSP Time (ms): 40
+----------------------------------------
+MPI Processes: 1
+OpenMP Threads: 2
+Batch Size: 1000
+Async Level: 2
+Vertices: 75888
+Edges: 508062
+Changes: 10000
+Initial SSSP Time (ms): 924
+Update SSSP Time (ms): 43
+----------------------------------------
